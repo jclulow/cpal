@@ -696,6 +696,24 @@ mod platform_impl {
     }
 }
 
+#[cfg(target_os = "illumos")]
+mod platform_impl {
+    pub use crate::host::illumos::{
+        Device as IllumosDevice, Devices as IllumosDevices, Host as IllumosHost, Stream as IllumosStream,
+        SupportedInputConfigs as IllumosSupportedInputConfigs,
+        SupportedOutputConfigs as IllumosSupportedOutputConfigs,
+    };
+
+    impl_platform_host!(Illumos illumos "illumos");
+
+    /// The default host for the current compilation target platform.
+    pub fn default_host() -> Host {
+        IllumosHost::new()
+            .expect("the default host should always be available")
+            .into()
+    }
+}
+
 #[cfg(not(any(
     windows,
     target_os = "linux",
@@ -706,6 +724,7 @@ mod platform_impl {
     target_os = "ios",
     target_os = "emscripten",
     target_os = "android",
+    target_os = "illumos",
     all(target_arch = "wasm32", feature = "wasm-bindgen"),
 )))]
 mod platform_impl {
