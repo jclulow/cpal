@@ -4,6 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use illumos_audio::mixer::AudioInfo;
+use illumos_audio::sys::AudioFormats;
 use illumos_audio::Dsp;
 
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -41,7 +42,11 @@ impl Device {
         })?;
 
         let format = match sample_format {
+            SampleFormat::I8 => illumos_audio::sys::AudioFormats::AFMT_S8,
+            SampleFormat::U8 => illumos_audio::sys::AudioFormats::AFMT_U8,
             SampleFormat::I16 => illumos_audio::sys::AudioFormats::AFMT_S16_NE,
+            SampleFormat::U16 => illumos_audio::sys::AudioFormats::AFMT_U16_NE,
+            SampleFormat::I32 => illumos_audio::sys::AudioFormats::AFMT_S32_NE,
             _ => {
                 return Err(BuildStreamError::StreamConfigNotSupported);
             }
@@ -330,29 +335,66 @@ impl DeviceTrait for Device {
     fn supported_output_configs(
         &self,
     ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
-        let range = SupportedStreamConfigRange {
-            channels: self
-                .info
+        let dsp = illumos_audio::Dsp::open_path(&self.devnode).map_err(|e| {
+            SupportedStreamConfigsError::BackendSpecific {
+                err: BackendSpecificError {
+                    description: format!("open(\"{}\"): {e}", self.devnode),
+                },
+            }
+        })?;
+
+        let formats = dsp
+            .formats()
+            .map_err(|e| SupportedStreamConfigsError::BackendSpecific {
+                err: BackendSpecificError {
+                    description: format!("get formats: {e}"),
+                },
+            })?;
+
+        let mut sf = Vec::new();
+        if formats.contains(AudioFormats::AFMT_S32_NE) {
+            sf.push(SampleFormat::I32);
+        }
+        if formats.contains(AudioFormats::AFMT_S16_NE) {
+            sf.push(SampleFormat::I16);
+        }
+        if formats.contains(AudioFormats::AFMT_U16_NE) {
+            sf.push(SampleFormat::U16);
+        }
+        if formats.contains(AudioFormats::AFMT_S8) {
+            sf.push(SampleFormat::I8);
+        }
+        if formats.contains(AudioFormats::AFMT_U8) {
+            sf.push(SampleFormat::U8);
+        }
+
+        let channels = self
+            .info
+            .as_ref()
+            .map(|info| info.max_channels)
+            .unwrap_or(2)
+            .try_into()
+            .unwrap();
+        let min_sample_rate =
+            SampleRate(self.info.as_ref().map(|info| info.min_rate).unwrap_or(8000));
+        let max_sample_rate = SampleRate(
+            self.info
                 .as_ref()
-                .map(|info| info.max_channels)
-                .unwrap_or(2)
-                .try_into()
-                .unwrap(),
-            min_sample_rate: SampleRate(
-                self.info.as_ref().map(|info| info.min_rate).unwrap_or(8000),
-            ),
-            max_sample_rate: SampleRate(
-                self.info
-                    .as_ref()
-                    .map(|info| info.max_rate)
-                    .unwrap_or(48000),
-            ),
-            buffer_size: SupportedBufferSize::Unknown,
-            sample_format: SampleFormat::I16,
-        };
+                .map(|info| info.max_rate)
+                .unwrap_or(48000),
+        );
 
         Ok(SupportedOutputConfigs {
-            configs: vec![range],
+            configs: sf
+                .into_iter()
+                .map(|sample_format| SupportedStreamConfigRange {
+                    channels,
+                    min_sample_rate,
+                    max_sample_rate,
+                    buffer_size: SupportedBufferSize::Unknown,
+                    sample_format,
+                })
+                .collect::<Vec<_>>(),
         })
     }
 
@@ -391,7 +433,7 @@ impl DeviceTrait for Device {
             channels: channels.try_into().unwrap(),
             sample_rate: SampleRate(speed.try_into().unwrap()),
             buffer_size: SupportedBufferSize::Unknown, /* XXX */
-            sample_format: SampleFormat::I16,          /* XXX */
+            sample_format: SampleFormat::I32,          /* XXX */
         })
     }
 
