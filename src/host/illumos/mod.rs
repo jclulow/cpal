@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,7 +42,7 @@ impl Device {
 
         let format = match sample_format {
             SampleFormat::I16 => illumos_audio::sys::AudioFormats::AFMT_S16_NE,
-            other => {
+            _ => {
                 return Err(BuildStreamError::StreamConfigNotSupported);
             }
         };
@@ -95,13 +96,14 @@ struct StreamInner {
     dsp: Dsp,
     sample_format: SampleFormat,
     config: StreamConfig,
+    playing: AtomicBool,
 }
 
 fn output_stream_worker(
     inner: &StreamInner,
     data_callback: &mut (dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
-    timeout: Option<Duration>,
+    _timeout: Option<Duration>,
 ) {
     let mut ctxt = StreamWorkerContext::new();
 
@@ -111,16 +113,78 @@ fn output_stream_worker(
     let start = Instant::now();
 
     /*
+     * Get the available buffer size prior to sending any data.
+     */
+    let ospc = inner.dsp.space_output().unwrap_or_else(|err| {
+        let description = format!("output space error: {err}");
+        error_callback(BackendSpecificError { description }.into());
+        Default::default()
+    });
+
+    /*
      * What is the size of a single sample in bytes?
      */
     let sampsz = (inner.sample_format.sample_size() as u64) * (inner.config.channels as u64);
 
+    /*
+     * What is the size of 50msec worth of audio data?
+     */
+    let sleepdel = 50;
+    let sleepsz = inner.config.sample_rate.0 as u64 * sampsz * sleepdel / 1000;
+
+    /*
+     * Should we do sleeps to wait for a minimal amount of buffer space?
+     */
+    let origsz: u64 = ospc.bytes.try_into().unwrap();
+    let sleeps = origsz >= 2 * sleepsz;
+
     loop {
+        if !inner.playing.load(Ordering::Relaxed) {
+            /*
+             * Wait to be told to play before sending more samples to the
+             * device.
+             */
+            std::thread::sleep(Duration::from_millis(sleepdel));
+            continue;
+        }
+
+        /*
+         * How much available space is there in the buffer?
+         */
+        let ospc = inner.dsp.space_output().unwrap_or_else(|err| {
+            let description = format!("output space error: {err}");
+            error_callback(BackendSpecificError { description }.into());
+            Default::default()
+        });
+        let cursz: u64 = ospc.bytes.try_into().unwrap();
+
+        if cursz == 0 || sleeps && cursz < 2 * sleepsz {
+            /*
+             * Wait for more buffer space.
+             */
+            std::thread::sleep(Duration::from_millis(sleepdel));
+            continue;
+        }
+
+        /*
+         * Check for errors.
+         */
+        match inner.dsp.errors() {
+            Ok(errs) => {
+                if !errs.is_ok() {
+                    println!("ERRORS: {errs:?}");
+                }
+            }
+            Err(e) => {
+                println!("ERRORS: COULD NOT GET ERRORS! {e}");
+            }
+        }
+
         /*
          * Determine the current output delay.  This is the number of bytes of
          * audio data to be played before any new data we write will be played.
          */
-        let delay = inner.dsp.delay().unwrap_or_else(|err| {
+        let delayb = inner.dsp.delay().unwrap_or_else(|err| {
             let description = format!("delay error: {err}");
             error_callback(BackendSpecificError { description }.into());
             0
@@ -130,28 +194,26 @@ fn output_stream_worker(
          * Turn the output delay in bytes into an output delay in nanoseconds
          * at our given sample rate.
          */
-        let delay = (delay as u64) / sampsz * 1_000_000_000 / (inner.config.sample_rate.0 as u64);
-
-        if delay <= 10_000_000 {
-            /*
-             * XXX sleep?
-             */
-            continue;
-        }
+        let delay = (delayb as u64) * 1_000_000_000 / sampsz / (inner.config.sample_rate.0 as u64);
 
         /*
          * XXX
          */
-        ctxt.buffer.resize(sampsz as usize * 1_000, 0u8);
+        ctxt.buffer.resize(ospc.bytes as usize, 0u8);
 
         {
             let data = ctxt.buffer.as_mut_ptr() as *mut ();
             let len = ctxt.buffer.len() / inner.sample_format.sample_size();
             let mut data = unsafe { Data::from_parts(data, len, inner.sample_format) };
 
-            let callback =
-                StreamInstant::from_nanos_i128(Instant::now().duration_since(start).as_nanos().try_into().unwrap())
-                    .unwrap();
+            let callback = StreamInstant::from_nanos_i128(
+                Instant::now()
+                    .duration_since(start)
+                    .as_nanos()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
             let playback = callback.add(Duration::from_nanos(delay)).unwrap();
 
             let info = OutputCallbackInfo {
@@ -169,46 +231,6 @@ fn output_stream_worker(
                 continue;
             }
         }
-
-        // let flow =
-        //     poll_descriptors_and_prepare_buffer(&rx, stream, &mut ctxt).unwrap_or_else(|err| {
-        //         error_callback(err.into());
-        //         PollDescriptorsFlow::Continue
-        //     });
-
-        // match flow {
-        //     PollDescriptorsFlow::Continue => continue,
-        //     PollDescriptorsFlow::XRun => {
-        //         if let Err(err) = stream.channel.prepare() {
-        //             error_callback(err.into());
-        //         }
-        //         continue;
-        //     }
-        //     PollDescriptorsFlow::Return => return,
-        //     PollDescriptorsFlow::Ready {
-        //         status,
-        //         avail_frames,
-        //         delay_frames,
-        //         stream_type,
-        //     } => {
-        //         assert_eq!(
-        //             stream_type,
-        //             StreamType::Output,
-        //             "expected output stream, but polling descriptors indicated input",
-        //         );
-        //         if let Err(err) = process_output(
-        //             stream,
-        //             &mut ctxt.buffer,
-        //             status,
-        //             avail_frames,
-        //             delay_frames,
-        //             data_callback,
-        //             error_callback,
-        //         ) {
-        //             error_callback(err.into());
-        //         }
-        //     }
-        // }
     }
 }
 
@@ -227,7 +249,7 @@ impl Stream {
          * Start a thread to shovel data out to the audio device.
          */
         let inner0 = Arc::clone(&inner);
-        let thread = thread::Builder::new()
+        thread::Builder::new()
             .name("cpal_audio_out".to_owned())
             .spawn(move || {
                 output_stream_worker(&inner0, &mut data_callback, &mut error_callback, timeout);
@@ -329,7 +351,9 @@ impl DeviceTrait for Device {
             sample_format: SampleFormat::I16,
         };
 
-        Ok(SupportedOutputConfigs { configs: vec![] })
+        Ok(SupportedOutputConfigs {
+            configs: vec![range],
+        })
     }
 
     #[inline]
@@ -403,6 +427,7 @@ impl DeviceTrait for Device {
             dsp: self.open_dsp(config, sample_format)?,
             config: config.clone(),
             sample_format,
+            playing: AtomicBool::new(false),
         });
 
         Ok(Stream::new_output(
@@ -443,12 +468,13 @@ impl HostTrait for Host {
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        println!("told to PLAY!");
-        Ok(()) /* XXX */
+        self.inner.playing.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn pause(&self) -> Result<(), PauseStreamError> {
-        unimplemented!()
+        self.inner.playing.store(false, Ordering::Relaxed);
+        Ok(())
     }
 }
 
