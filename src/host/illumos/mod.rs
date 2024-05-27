@@ -132,9 +132,9 @@ fn output_stream_worker(
     let sampsz = (inner.sample_format.sample_size() as u64) * (inner.config.channels as u64);
 
     /*
-     * What is the size of 50msec worth of audio data?
+     * What is the size of 10msec worth of audio data?
      */
-    let sleepdel = 50;
+    let sleepdel = 10;
     let sleepsz = inner.config.sample_rate.0 as u64 * sampsz * sleepdel / 1000;
 
     /*
@@ -174,16 +174,16 @@ fn output_stream_worker(
         /*
          * Check for errors.
          */
-        match inner.dsp.errors() {
-            Ok(errs) => {
-                if !errs.is_ok() {
-                    println!("ERRORS: {errs:?}");
-                }
-            }
-            Err(e) => {
-                println!("ERRORS: COULD NOT GET ERRORS! {e}");
-            }
-        }
+        // match inner.dsp.errors() {
+        //     Ok(errs) => {
+        //         if !errs.is_ok() {
+        //             println!("ERRORS: {errs:?}");
+        //         }
+        //     }
+        //     Err(e) => {
+        //         println!("ERRORS: COULD NOT GET ERRORS! {e}");
+        //     }
+        // }
 
         /*
          * Determine the current output delay.  This is the number of bytes of
@@ -433,7 +433,7 @@ impl DeviceTrait for Device {
             channels: channels.try_into().unwrap(),
             sample_rate: SampleRate(speed.try_into().unwrap()),
             buffer_size: SupportedBufferSize::Unknown, /* XXX */
-            sample_format: SampleFormat::I32,          /* XXX */
+            sample_format: SampleFormat::I16, /* XXX */
         })
     }
 
